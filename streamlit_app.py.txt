@@ -1,0 +1,223 @@
+import streamlit as st
+import sqlite3
+import hashlib
+import pandas as pd
+from datetime import datetime
+import io
+
+# -------------------------
+# CONFIG
+# -------------------------
+st.set_page_config(page_title="Sistema de Votação", layout="centered")
+
+INICIO_VOTACAO = datetime(2026, 4, 25, 0, 0) # 25 de Abril 00:00
+FIM_VOTACAO = datetime(2026, 4, 26, 12, 0) # 26 de Abril 12:00
+SENHA_ADMIN = "admin123"
+
+# CORES
+st.markdown("""
+<style>
+.stButton>button {
+    background-color: #004AAD;
+    color: white;
+    border-radius: 8px;
+    height: 3em;
+    width: 100%;
+}
+h1 {
+    color: #004AAD;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# LOGO + TITULO
+col1, col2 = st.columns([1,3])
+with col1:
+    st.image("logo.png", width=80)
+with col2:
+    st.markdown("<h1>Sistema de Votação</h1>", unsafe_allow_html=True)
+
+st.info(f"**Período:** {INICIO_VOTACAO.strftime('%d/%m %H:%M')} até {FIM_VOTACAO.strftime('%d/%m %H:%M')}")
+
+# -------------------------
+# BASE DE DADOS
+# -------------------------
+conn = sqlite3.connect("dados.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS usuarios (
+    numero_documento TEXT PRIMARY KEY,
+    nome TEXT,
+    tipo TEXT,
+    votou INTEGER DEFAULT 0
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS votos (
+    numero_documento TEXT,
+    voto TEXT,
+    timestamp TEXT
+)
+""")
+conn.commit()
+
+# -------------------------
+# FUNÇÕES
+# -------------------------
+def dentro_do_periodo():
+    agora = datetime.now()
+    return INICIO_VOTACAO <= agora <= FIM_VOTACAO
+
+def tempo_restante():
+    agora = datetime.now()
+    if agora < INICIO_VOTACAO:
+        return f"Votação começa em: {INICIO_VOTACAO.strftime('%d/%m %H:%M')}"
+    elif agora > FIM_VOTACAO:
+        return "Votação encerrada"
+    else:
+        restante = FIM_VOTACAO - agora
+        horas, resto = divmod(restante.seconds, 3600)
+        minutos, _ = divmod(resto, 60)
+        return f"Tempo restante: {horas}h {minutos}min"
+
+def carregar_documentos_validos():
+    try:
+        df = pd.read_excel("dados.xlsx")
+        return df["numero_documento"].astype(str).tolist()
+    except:
+        return []
+
+def registrar(doc, nome):
+    try:
+        cursor.execute("INSERT INTO usuarios (numero_documento, nome) VALUES (?,?)", (doc, nome))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def ja_votou(doc):
+    cursor.execute("SELECT votou FROM usuarios WHERE numero_documento=?", (doc,))
+    res = cursor.fetchone()
+    return res and res[0] == 1
+
+def votar(doc, voto):
+    cursor.execute("INSERT INTO votos VALUES (?,?,?)", (doc, voto, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    cursor.execute("UPDATE usuarios SET votou = 1 WHERE numero_documento =?", (doc,))
+    conn.commit()
+
+def get_resultados():
+    df = pd.read_sql_query("SELECT voto, COUNT(*) as total FROM votos GROUP BY voto", conn)
+    total_votos = pd.read_sql_query("SELECT COUNT(*) as total FROM votos", conn).iloc[0]['total']
+    total_eleitores = pd.read_sql_query("SELECT COUNT(*) as total FROM usuarios", conn).iloc[0]['total']
+    return df, total_votos, total_eleitores
+
+def resetar_votacao():
+    cursor.execute("DELETE FROM votos")
+    cursor.execute("DELETE FROM usuarios")
+    conn.commit()
+
+def exportar_excel():
+    df_votos = pd.read_sql_query("SELECT * FROM votos", conn)
+    df_usuarios = pd.read_sql_query("SELECT * FROM usuarios", conn)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df_votos.to_excel(writer, sheet_name='Votos', index=False)
+        df_usuarios.to_excel(writer, sheet_name='Eleitores', index=False)
+    return output.getvalue()
+
+# -------------------------
+# ADMIN PADRÃO
+# -------------------------
+cursor.execute("SELECT * FROM usuarios WHERE numero_documento='admin'")
+if not cursor.fetchone():
+    cursor.execute("INSERT INTO usuarios VALUES ('admin', 'Administrador', 'admin', 0)")
+    conn.commit()
+
+# -------------------------
+# TABS
+# -------------------------
+tab1, tab2 = st.tabs(["Votação", "Área Administrador"])
+
+# -------------------------
+# TAB VOTAÇÃO
+# -------------------------
+with tab1:
+    st.write(tempo_restante())
+
+    if not dentro_do_periodo():
+        st.warning("Fora do período de votação.")
+    else:
+        doc = st.text_input("Número de Documento")
+        nome = st.text_input("Nome Completo")
+
+        if st.button("Entrar e Votar"):
+            docs_validos = carregar_documentos_validos()
+
+            if not doc or not nome:
+                st.error("Preencha todos os campos")
+            elif docs_validos and doc not in docs_validos:
+                st.error("Documento não autorizado!")
+            elif ja_votou(doc):
+                st.error("Este documento já votou!")
+            else:
+                registrar(doc, nome)
+                st.session_state['logado'] = True
+                st.session_state['doc'] = doc
+                st.success(f"Bem-vindo, {nome}. Pode votar abaixo.")
+                st.rerun()
+
+        if st.session_state.get('logado'):
+            st.markdown("---")
+            st.subheader("Escolha seu voto")
+            voto = st.radio("Você vota:", ["SIM", "NÃO"], horizontal=True)
+
+            if st.button("Confirmar Voto"):
+                votar(st.session_state['doc'], voto)
+                st.success("Voto registado com sucesso!")
+                st.balloons()
+                st.session_state['logado'] = False
+                st.session_state['doc'] = ""
+                st.rerun()
+
+# -------------------------
+# TAB ADMIN
+# -------------------------
+with tab2:
+    senha = st.text_input("Senha do Administrador", type="password")
+
+    if senha == SENHA_ADMIN:
+        st.success("Acesso liberado")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Reiniciar Votação"):
+                resetar_votacao()
+                st.warning("Todos os registos e votos foram apagados!")
+                st.rerun()
+        with col2:
+            excel_data = exportar_excel()
+            st.download_button(
+                label="📥 Exportar para Excel",
+                data=excel_data,
+                file_name=f"resultados_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            )
+
+        st.markdown("---")
+        st.subheader("📊 Resultados")
+        df_resultados, total_votos, total_eleitores = get_resultados()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total de Votos", total_votos)
+        c2.metric("Total de Eleitores", total_eleitores)
+        c3.metric("Participação", f"{(total_votos/total_eleitores*100):.1f}%" if total_eleitores > 0 else "0%")
+
+        if not df_resultados.empty:
+            st.table(df_resultados)
+            st.bar_chart(df_resultados.set_index('voto'))
+        else:
+            st.info("Nenhum voto ainda.")
+
+    elif senha:
+        st.error("Senha incorreta")
